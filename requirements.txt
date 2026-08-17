@@ -1,0 +1,5 @@
+playwright
+yt-dlp
+mlx-whisper
+soundfile
+numpy

@@ -1,0 +1,8 @@
+venv/
+browser_session/
+temp_audio/
+outputs/
+*.mp3
+*.wav
+__pycache__/
+.DS_Store
