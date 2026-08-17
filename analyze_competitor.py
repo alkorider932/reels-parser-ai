@@ -18,6 +18,11 @@ TEMP_AUDIO_DIR = "temp_audio"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(TEMP_AUDIO_DIR, exist_ok=True)
 
+# Текущий год для отсечки глубины поиска
+CURRENT_YEAR = datetime.now().year
+MAX_POOL_SIZE = 350
+TOP_REELS_COUNT = 25
+
 def clean_filename(name):
     return re.sub(r'[\\/*?:"<>|]', "", name).strip().replace(" ", "_")
 
@@ -98,7 +103,6 @@ def fetch_reel_metadata_and_audio(url, shortcode):
                 meta["likes"] = info.get("like_count") or 0
                 meta["comments"] = info.get("comment_count") or 0
                 
-                # Форматирование даты публикации
                 raw_date = info.get("upload_date")
                 if raw_date and len(raw_date) == 8:
                     meta["upload_date"] = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:]}"
@@ -112,8 +116,7 @@ def fetch_reel_metadata_and_audio(url, shortcode):
             candidates = glob.glob(os.path.join(TEMP_AUDIO_DIR, f"{shortcode}.*"))
             if candidates:
                 meta["audio_path"] = candidates[0]
-    except Exception as e:
-        # Резервный вызов через CLI
+    except Exception:
         try:
             cmd = [
                 sys.executable.replace("python3", "yt-dlp"),
@@ -167,6 +170,7 @@ def transcribe_audio_with_timestamps(audio_path):
 def extract_posts_playwright(profile_url):
     reels_data = {}
     bio_text = ""
+    reached_previous_year = False
 
     with sync_playwright() as p:
         browser = p.chromium.launch_persistent_context(
@@ -178,11 +182,13 @@ def extract_posts_playwright(profile_url):
         page = browser.new_page()
 
         def handle_response(response):
-            nonlocal reels_data
+            nonlocal reels_data, reached_previous_year
             if "/graphql/query" in response.url or "/api/v1/" in response.url:
                 try:
                     data = response.json()
-                    parse_graphql_data(data, reels_data)
+                    has_old_posts = parse_graphql_data(data, reels_data)
+                    if has_old_posts:
+                        reached_previous_year = True
                 except Exception:
                     pass
 
@@ -190,6 +196,7 @@ def extract_posts_playwright(profile_url):
         
         reels_page_url = profile_url.rstrip("/") + "/reels/"
         print(f"🌐 Открытие страницы в Chrome: {reels_page_url}")
+        print(f"🎯 Сбор публикаций за {CURRENT_YEAR} год (лимит пула: до {MAX_POOL_SIZE} постов)...")
         page.goto(reels_page_url, wait_until="domcontentloaded", timeout=60000)
         time.sleep(3)
 
@@ -201,10 +208,10 @@ def extract_posts_playwright(profile_url):
             bio_text = ""
 
         scroll_attempts = 0
-        max_scrolls = 25
+        max_scrolls = 80  # Достаточно для сбора сотен постов
         last_count = 0
 
-        while len(reels_data) < 100 and scroll_attempts < max_scrolls:
+        while len(reels_data) < MAX_POOL_SIZE and scroll_attempts < max_scrolls:
             try:
                 anchors = page.query_selector_all('a[href*="/reel/"]')
                 for a in anchors:
@@ -221,17 +228,27 @@ def extract_posts_playwright(profile_url):
                                 "likes": 0,
                                 "comments": 0,
                                 "caption": "",
-                                "upload_date": "Не указана"
+                                "upload_date": "Не указана",
+                                "year": CURRENT_YEAR
                             }
             except Exception:
                 pass
 
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            time.sleep(2.5)
+            time.sleep(1.8)
             scroll_attempts += 1
             current_count = len(reels_data)
-            print(f"📊 Собрано публикаций в пуле: {current_count}/100...")
-            if current_count == last_count and scroll_attempts > 6:
+            
+            if scroll_attempts % 3 == 0:
+                print(f"📊 Собрано публикаций в пуле: {current_count}...")
+
+            # Остановка при переходе за пределы текущего года (если найдено достаточно постов)
+            if reached_previous_year and current_count >= TOP_REELS_COUNT:
+                print(f"⏳ Достигнуты публикации за прошлые годы. Завершение скроллинга.")
+                break
+
+            if current_count == last_count and scroll_attempts > 10:
+                # Достигли самого низа профиля
                 break
             last_count = current_count
 
@@ -240,7 +257,10 @@ def extract_posts_playwright(profile_url):
     return reels_data, bio_text
 
 def parse_graphql_data(data, reels_dict):
+    found_older_year = False
+    
     def recursive_search(obj):
+        nonlocal found_older_year
         if isinstance(obj, dict):
             if "shortcode" in obj or "code" in obj:
                 sc = obj.get("shortcode") or obj.get("code")
@@ -259,12 +279,17 @@ def parse_graphql_data(data, reels_dict):
                     obj.get("comment_count") or 0
                 )
                 
-                # Дата
+                # Анализ года публикации
                 taken_at = obj.get("taken_at_timestamp") or obj.get("taken_at")
                 upload_date = "Не указана"
+                post_year = CURRENT_YEAR
                 if taken_at:
                     try:
-                        upload_date = datetime.fromtimestamp(int(taken_at)).strftime('%Y-%m-%d')
+                        dt = datetime.fromtimestamp(int(taken_at))
+                        upload_date = dt.strftime('%Y-%m-%d')
+                        post_year = dt.year
+                        if post_year < CURRENT_YEAR:
+                            found_older_year = True
                     except Exception:
                         pass
                 
@@ -284,7 +309,8 @@ def parse_graphql_data(data, reels_dict):
                             "likes": int(likes),
                             "comments": int(comments),
                             "caption": caption.strip(),
-                            "upload_date": upload_date
+                            "upload_date": upload_date,
+                            "year": post_year
                         }
             for v in obj.values():
                 recursive_search(v)
@@ -293,6 +319,7 @@ def parse_graphql_data(data, reels_dict):
                 recursive_search(item)
 
     recursive_search(data)
+    return found_older_year
 
 def main():
     if len(sys.argv) < 2:
@@ -309,18 +336,18 @@ def main():
         print("⚠️ Не удалось получить список Reels. Запустите login_instagram.py.")
         sys.exit(1)
 
-    print(f"\n✅ Всего уникальных роликов собрано: {len(reels_dict)}")
-    sorted_reels = sorted(reels_dict.values(), key=lambda x: x["views"], reverse=True)[:25]
-    print(f"🏆 Отобран Топ-{len(sorted_reels)} самых вирусных роликов для расшифровки.")
+    print(f"\n✅ Всего публикаций просканировано: {len(reels_dict)}")
+    
+    # Сортировка по просмотрам и отбор самых мощных вирусных роликов
+    sorted_reels = sorted(reels_dict.values(), key=lambda x: x["views"], reverse=True)[:TOP_REELS_COUNT]
+    print(f"🏆 Отобран Топ-{len(sorted_reels)} вирусных роликов по просмотрам для полной расшифровки.")
 
     results = []
     for idx, item in enumerate(sorted_reels, 1):
         print(f"\n[{idx}/{len(sorted_reels)}] 🚀 Анализ и транскрибация: {item['url']} ({format_number(item['views'])} просм.)")
         
-        # Получаем аудио + глубокие метаданные (описание, дату, комментарии)
         meta = fetch_reel_metadata_and_audio(item["url"], item["shortcode"])
         
-        # Обогащаем поля, если yt-dlp нашел больше деталей
         if meta["caption"]:
             item["caption"] = meta["caption"]
         if meta["likes"] and item["likes"] == 0:
@@ -340,7 +367,6 @@ def main():
 
         results.append(item)
 
-    # Генерация полного отчета в Markdown
     report_filename = f"{clean_filename(username)}_reels_report.md"
     report_path = os.path.join(OUTPUT_DIR, report_filename)
 
